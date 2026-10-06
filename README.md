@@ -50,6 +50,14 @@
   任一步超容则整批 `409`，响应体带首个失败项从 1 起的 `index`，且样本（含本批回收的旧样本）、
   片段、样本与片段编号、匹配进度与命中记录**均恢复批前状态**。整批在会话锁内一次完成，
   等效于与会话内其他操作的一次串行执行：其他操作不能插入批内，查询与分叉只能看到批前或批后状态。
+- **撤销最近一次写入**：`POST /sessions/{sid}/undo` 撤销会话最近一次成功的单条或整批采样写入，
+  用于纠正已接收的误采样。每会话仅保留**最近一次成功写入前**的状态（整批以**首项写入前**为准）：
+  撤销恢复存活样本（**含该次写入时回收的旧样本**）、全部片段、样本与片段两类编号、匹配进度与
+  命中记录；**不重放样本**，撤销后记录清空（再次撤销返回 `409`），后续写入从恢复的序号继续。
+  **成功触发、删除片段、调参、配置模式或启用留样都会使记录失效**；失败请求（含容量拒绝与
+  整批回滚）、查询与分叉不影响记录，**新分支不继承记录**。记录仅存内存且不计入样本容量；
+  撤销与同会话其他操作串行，查询不会看到部分恢复。未知会话 `404`，无可撤销记录 `409`，
+  成功返回 `200` 与原会话查询格式。
 
 ## 启动
 
@@ -80,6 +88,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | POST | `/sessions/{sid}/samples/batch` | 成组批量写入 1～100 个整数样本：整批接收或整批拒绝，超容返回 `409` 与首个失败项的 `index` |
+| POST | `/sessions/{sid}/undo` | 撤销最近一次成功的单条或整批写入，返回会话状态（无可撤销记录返回 `409`） |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
 | POST | `/sessions/{sid}/hit-fragments/enable` | 启用命中留样：每次模式命中自动生成 `completed` 留样片段（每会话一次） |
@@ -92,7 +101,8 @@ docker run --rm -p 8000:8000 sample-fragment-service
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
 未删除片段总长或所需序号并集超过新 `C`）、命中留样启用条件不满足（未配置 pattern、已有样本、
 重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）、
-批量写入任一步超容（响应体带首个失败项从 1 起的 `index`，整批回滚）；
+批量写入任一步超容（响应体带首个失败项从 1 起的 `index`，整批回滚）、
+撤销时无可撤销记录（最近一次成功写入的记录不存在或已失效）；
 `400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；`422` 请求体不合法
 （含 pattern 长度非法、元素为布尔值或字符串，
 调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`，
@@ -678,6 +688,117 @@ curl -s -X POST http://localhost:8000/sessions/13/samples/batch \
 
 启用命中留样的会话同样适用：批内命中即时生成留样片段并参与后续步骤的容量核算；
 若整批失败，批内生成的留样片段、片段编号与命中记录也一并回滚。
+
+### 19. 命中留样后撤销：恢复样本、片段、两类编号与命中记录
+
+会话 14 以 `H=2, C=6` 创建，配置长度 5 的 pattern `[7,8,9,7,8]` 并启用命中留样，
+写入 `7 8 9 7 8` 后 `seq=5` 命中，自动生成留样片段 1：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 6}'
+# {"session_id":14,"history":2,"capacity":6}
+
+curl -s -X PUT http://localhost:8000/sessions/14/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [7, 8, 9, 7, 8]}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/14/hit-fragments/enable > /dev/null
+
+for v in 7 8 9 7 8; do
+  curl -s -X POST http://localhost:8000/sessions/14/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+
+curl -s http://localhost:8000/sessions/14
+# {"session_id":14,"history":2,"capacity":6,"next_seq":6,"used":5,
+#  "stored_seqs":[1,2,3,4,5],"fragments":[1]}
+
+curl -s http://localhost:8000/sessions/14/pattern/hits
+# {"pattern":[7,8,9,7,8],"hit_count":1,"recent_hits":[{"start_seq":1,"end_seq":5}]}
+```
+
+发现 `seq=5` 是误采样，撤销最近一次成功写入（即写入 `seq=5` 的那条）：留样片段 1 消失、
+片段编号回退、命中记录清空、匹配进度与存活样本恢复到写入前（含临时前缀保留的序号 1–4）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/14/undo
+# {"session_id":14,"history":2,"capacity":6,"next_seq":5,"used":4,
+#  "stored_seqs":[1,2,3,4],"fragments":[]}
+
+curl -s http://localhost:8000/sessions/14/pattern/hits
+# {"pattern":[7,8,9,7,8],"hit_count":0,"recent_hits":[]}
+
+curl -s http://localhost:8000/sessions/14/fragments
+# []
+```
+
+记录已清空，再次撤销返回 `409`；重新写入后序号从恢复的 5 继续，命中与留样片段
+随新写入重新产生（片段编号也从恢复的 1 继续，撤销本身不重放样本）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/14/undo
+# 409   —— 没有可撤销的写入记录
+
+curl -s -X POST http://localhost:8000/sessions/14/samples \
+  -H 'Content-Type: application/json' -d '{"value": 8}'
+# {"seq":5,"value":8}   —— 重新命中 (1,5)，再次自动生成片段 1
+
+curl -s http://localhost:8000/sessions/14/fragments
+# [{"fragment_id":1,"center":5,"before":4,"after":0,"start":1,"end":5,"status":"completed"}]
+```
+
+### 20. 失败批次后撤销上次成功写入
+
+会话 15（`H=2, C=4`）写入 3 条后触发片段 1（引用序号 2–4），再写 1 条使其完成；
+随后批量写入 `[50, 60, 70]` 在第 2 项超容，整批 `409` 回滚。**失败请求不影响撤销记录**，
+记录仍是最近一次成功写入（`seq=4`）之前的状态：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":15,"history":2,"capacity":4}
+
+for v in 10 20 30; do
+  curl -s -X POST http://localhost:8000/sessions/15/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+curl -s -X POST http://localhost:8000/sessions/15/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 1}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/15/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}' > /dev/null   # seq=4，片段 1 completed
+
+curl -s -w '\n%{http_code}\n' -X POST http://localhost:8000/sessions/15/samples/batch \
+  -H 'Content-Type: application/json' -d '{"values": [50, 60, 70]}'
+# {"detail":"容量不足：新样本无处容纳，序号未消耗，状态未改变","index":2}
+# 409   —— 整批回滚，next_seq 仍为 5；撤销记录不受影响
+```
+
+撤销回退的是**最近一次成功写入**（`seq=4`），而非失败的批次：序号 4 被收回，
+片段 1 从 `completed` 回到 `pending`（重新等待 `seq=4`）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/15/undo
+# {"session_id":15,"history":2,"capacity":4,"next_seq":4,"used":2,
+#  "stored_seqs":[2,3],"fragments":[1]}
+
+curl -s http://localhost:8000/sessions/15/fragments/1
+# {"fragment_id":1,"center":3,"before":1,"after":1,"start":2,"end":4,"status":"pending",
+#  "samples":[{"seq":2,"value":20},{"seq":3,"value":30}]}
+```
+
+后续写入从恢复的序号继续；而**成功触发会使记录失效**——触发片段 2 后再撤销返回 `409`：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/15/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}'
+# {"seq":4,"value":40}   —— 序号连续，片段 1 重新 completed
+
+curl -s -X POST http://localhost:8000/sessions/15/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 0}'
+# {"fragment_id":2,"center":4,"before":1,"after":0,"start":3,"end":4,"status":"completed"}
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/15/undo
+# 409   —— 成功触发已使撤销记录失效
+```
 
 ## 本地开发（可选）
 

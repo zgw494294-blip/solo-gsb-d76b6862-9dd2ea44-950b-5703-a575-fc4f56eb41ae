@@ -36,6 +36,14 @@ completed 片段（center=命中末条序号、before=模式长度减 1、after=
 片段、样本与片段编号、匹配进度与命中记录均恢复批前状态，本批回收的旧
 样本也一并还原。整批在会话锁内一次完成，等效于与会话内其他操作的一次
 串行执行：其他操作不能插入批内，查询与分叉只能看到批前或批后状态。
+
+撤销最近一次成功写入：每会话仅保留最近一次成功单条或整批写入前的状态
+（整批以首项写入前为准），可经 HTTP 撤销一次以纠正已接收的误采样——恢复
+存活样本（含该次写入时回收的旧样本）、全部片段、样本与片段两类编号、
+匹配进度与命中记录；不重放样本，撤销后记录清空，后续写入从恢复的序号
+继续。成功触发、删除片段、调参、配置模式或启用留样使记录失效；失败请求、
+查询与分叉不影响记录，新分支不继承记录。记录仅存内存且不计入样本容量；
+撤销在会话锁内一次完成，与同会话其他操作串行，查询不会看到部分恢复。
 """
 from __future__ import annotations
 
@@ -220,6 +228,10 @@ class Session:
         # 命中留样：已配置 pattern 且尚未写入样本时可经 HTTP 启用一次；
         # 启用后命中自动生成 completed 片段，临时前缀参与容量核算
         self.preserve_hits = False
+        # 撤销记录：最近一次成功写入（整批为首项写入）前的状态快照；
+        # 仅存内存、不计入样本容量；成功触发/删除片段/调参/配置模式/
+        # 启用留样后失效，分叉不继承
+        self.undo_snapshot: dict | None = None
         self.lock = asyncio.Lock()
 
     # ---- 容量核算 ----
@@ -278,6 +290,8 @@ class Session:
         self.history = history
         self.capacity = capacity
         self.reclaim()
+        # 调参成功使撤销记录失效（校验失败已在上面抛 409，记录不变）
+        self.undo_snapshot = None
 
     # ---- 模式识别 ----
 
@@ -290,6 +304,7 @@ class Session:
         self.pattern = list(pattern)
         self.matcher = PatternMatcher(self.pattern)
         self.pattern_configured = True
+        self.undo_snapshot = None  # 配置模式使撤销记录失效
 
     def enable_hit_fragments(self) -> None:
         """启用命中留样；每会话一次，条件不满足均抛 409 且不改变任何状态。
@@ -307,6 +322,7 @@ class Session:
         if len(self.pattern) > self.capacity:
             raise _conflict("模式长度超过样本容量 C，无法启用命中留样")
         self.preserve_hits = True
+        self.undo_snapshot = None  # 启用留样使撤销记录失效
 
     def observe(self, seq: int, value: int) -> None:
         """样本成功提交后喂入自动机；命中则追加记录（与写样本同一串行临界区）。"""
@@ -318,12 +334,27 @@ class Session:
 
     # ---- 操作 ----
 
-    def write(self, value: int) -> int:
+    def write(self, value: int, record_undo: bool = True) -> int:
         """写入一条样本；容量不足时抛 409，不消耗序号、不改变历史或片段。
 
         容量拒绝时不推进匹配状态、不产生命中记录；只有成功提交才喂入自动机，
         因此同一值被拒绝后重试成功只会被识别一次。
+        record_undo 为真（HTTP 单条写入）时，先把撤销记录更新为本次写入前
+        的状态；写入失败则恢复原记录——失败请求不影响记录。批内逐条写入
+        传 False，整批记录由 write_batch 以首项写入前的状态统一掌管。
         """
+        if not record_undo:
+            return self._write(value)
+        saved_record = self.undo_snapshot
+        self.undo_snapshot = self._snapshot_state()
+        try:
+            return self._write(value)
+        except HTTPException:
+            self.undo_snapshot = saved_record
+            raise
+
+    def _write(self, value: int) -> int:
+        """单条写入的核心逻辑：容量核算、提交与识别（不含撤销记录管理）。"""
         n = self.next_seq
         if self.preserve_hits:
             return self._write_preserving(n, value)
@@ -381,29 +412,60 @@ class Session:
         匹配进度与命中记录——再抛 BatchConflictError（携带首个失败项
         从 1 起的序号）。调用方在会话锁内执行本方法，故整批等效于与会话
         内其他操作的一次串行执行，查询与分叉只能看到批前或批后状态。
+        整批成功时撤销记录更新为首项写入前的状态；整批失败属失败请求，
+        撤销记录保持批前原样。
         """
-        saved_next_seq = self.next_seq
-        saved_samples = dict(self.samples)
-        saved_fragments = dict(self.fragments)  # 命中留样会就地增删，须复制
-        saved_next_fragment_id = self.next_fragment_id
-        saved_matcher_state = self.matcher.state if self.matcher is not None else None
-        saved_hit_count = self.hit_count
-        saved_recent_hits = deque(self.recent_hits, maxlen=100)
+        saved_record = self.undo_snapshot
+        snapshot = self._snapshot_state()
         seqs: list[int] = []
         try:
             for value in values:
-                seqs.append(self.write(value))
+                seqs.append(self.write(value, record_undo=False))
         except HTTPException as exc:
-            self.next_seq = saved_next_seq
-            self.samples = saved_samples
-            self.fragments = saved_fragments
-            self.next_fragment_id = saved_next_fragment_id
-            if self.matcher is not None:
-                self.matcher.state = saved_matcher_state
-            self.hit_count = saved_hit_count
-            self.recent_hits = saved_recent_hits
+            self._restore_state(snapshot)
+            self.undo_snapshot = saved_record
             raise BatchConflictError(len(seqs) + 1, str(exc.detail)) from exc
+        self.undo_snapshot = snapshot
         return seqs
+
+    # ---- 撤销记录 ----
+
+    def _snapshot_state(self) -> dict:
+        """捕获写入会改变的全部状态，作为撤销记录（仅存内存，不占样本容量）。"""
+        return {
+            "next_seq": self.next_seq,
+            "samples": dict(self.samples),
+            "fragments": dict(self.fragments),
+            "next_fragment_id": self.next_fragment_id,
+            "matcher_state": self.matcher.state if self.matcher is not None else None,
+            "hit_count": self.hit_count,
+            "recent_hits": deque(self.recent_hits, maxlen=100),
+        }
+
+    def _restore_state(self, snap: dict) -> None:
+        """把快照内容写回会话状态（撤销与整批回滚共用）。"""
+        self.next_seq = snap["next_seq"]
+        self.samples = dict(snap["samples"])
+        self.fragments = dict(snap["fragments"])
+        self.next_fragment_id = snap["next_fragment_id"]
+        if self.matcher is not None:
+            self.matcher.state = snap["matcher_state"]
+        self.hit_count = snap["hit_count"]
+        self.recent_hits = deque(snap["recent_hits"], maxlen=100)
+
+    def undo(self) -> None:
+        """撤销最近一次成功的单条或整批写入，恢复其写入前的状态。
+
+        恢复存活样本（含该次写入时回收的旧样本）、全部片段、样本与片段
+        编号、匹配进度与命中记录；不重放样本。撤销后记录清空（再次撤销
+        抛 409），后续写入从恢复的序号继续并生成新的撤销记录。无可撤销
+        记录时抛 409 且不改变任何状态。
+        """
+        snap = self.undo_snapshot
+        if snap is None:
+            raise _conflict("没有可撤销的写入记录")
+        self._restore_state(snap)
+        self.undo_snapshot = None
 
     def trigger(self, before: int, after: int) -> Fragment:
         """以当前末条为中心创建片段；历史不足时抛 409。"""
@@ -423,6 +485,7 @@ class Session:
         frag = Fragment(self.next_fragment_id, center, before, after)
         self.fragments[frag.fragment_id] = frag
         self.next_fragment_id += 1
+        self.undo_snapshot = None  # 成功触发使撤销记录失效
         return frag
 
     def status_of(self, frag: Fragment) -> str:
@@ -438,6 +501,7 @@ class Session:
         命中留样启用状态（临时前缀即自动机 state 对应的流尾，随之复制）。
         只复制存活状态：已回收样本不恢复，也不重放样本重新识别——自动机的
         state/failure 与 hit_count、recent_hits 原样拷贝，两支后续识别各自独立。
+        撤销记录不随分叉复制，新分支从空记录开始；来源的撤销记录也不受影响。
         调用方保证在来源锁内取号并调用本方法，故快照对应与来源操作串行的
         某个确定时刻；来源自身不做任何修改。
         """
@@ -603,6 +667,23 @@ async def write_samples_batch(session_id: int, req: WriteBatchRequest) -> dict:
         }
 
 
+@app.post("/sessions/{session_id}/undo")
+async def undo_last_write(session_id: int) -> dict:
+    """撤销最近一次成功的单条或整批采样写入，纠正已接收的误采样。
+
+    恢复该次写入前的存活样本（含写入时回收的旧样本）、全部片段、样本与
+    片段两类编号、匹配进度与命中记录；不重放样本，撤销后记录清空，后续
+    写入从恢复的序号继续。成功触发、删除片段、调参、配置模式或启用留样
+    都会使记录失效；失败请求、查询与分叉不影响记录，新分支不继承记录。
+    撤销在会话锁内一次完成，查询不会看到部分恢复。会话不存在返回 404；
+    无可撤销记录返回 409；成功返回 200 与原会话查询格式。
+    """
+    sess = _get_session(session_id)
+    async with sess.lock:
+        sess.undo()
+        return _session_summary(sess)
+
+
 @app.put("/sessions/{session_id}/pattern")
 async def configure_pattern(session_id: int, req: ConfigurePatternRequest) -> dict:
     sess = _get_session(session_id)
@@ -679,3 +760,4 @@ async def delete_fragment(session_id: int, fragment_id: int) -> None:
             raise HTTPException(status_code=404, detail="片段不存在")
         # 解除引用后立刻回收不再被任何一方需要的样本
         sess.reclaim()
+        sess.undo_snapshot = None  # 删除片段使撤销记录失效
